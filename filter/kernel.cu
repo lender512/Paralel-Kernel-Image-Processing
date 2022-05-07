@@ -1,4 +1,4 @@
-﻿#include "cuda_runtime.h"
+#include "cuda_runtime.h"
 #include "device_launch_parameters.h"
 
 #include <stdio.h>
@@ -8,160 +8,170 @@
 #include <opencv2/highgui.hpp>
 #include <opencv2/imgcodecs.hpp>
 
+/* HARDWARE CONFIGURATION */
+#define BLOCK_SIZE 16
 
 
-#define from2Dto1D(i, j) (((j) * gridDim.x) + (i))
-__global__ void betterCombKernel(const unsigned char* source, unsigned char* target, const int* kernel, int kernelDim, int divisor)
+
+/* KERNEL FILTER CONFIGURATION */
+
+#define kernelDim 3
+
+#define kernelDivisor 1
+
+__constant__ float kernel[kernelDim*kernelDim] =
+
+//{
+//    0, 0, 1, 2, 1, 0, 0,
+//    0, 3, 13, 22, 13, 3, 0,
+//    1, 13, 59, 97, 59, 13, 1,
+//    2, 22, 97, 159, 97, 22, 2,
+//    1, 13, 59, 97, 59, 13, 1,
+//    0, 3, 13, 22, 13, 3, 0,
+//    0, 0, 1, 2, 1, 0, 0
+//};
+
+/*{
+    1, 4, 6, 4, 1,
+    4, 16, 24, 16, 4,
+    2, 24, 36, 24, 2,
+    4, 16, 24, 16, 4,
+    1, 4, 6, 4, 1
+ };*/
+
+/*{
+    1, 4, 6, 4, 1,
+    4, 16, 24, 16, 4,
+    2, 24, -476, 24, 2,
+    4, 16, 24, 16, 4,
+    1, 4, 6, 4, 1
+ };*/
+
+/*{ 
+    -1, 0, 1,
+    -1, 0, 1,
+    -1, 0, 1 
+};*/
+
 {
+    -1, 0, 1,
+    -1, 0, 1,
+    -1, 0, 1
+};
 
-    //int kernelDim = 5;
-    int x = blockIdx.x + kernelDim / 2;
-    int y = blockIdx.y + kernelDim / 2;
 
-    
-    int idx = x + y * gridDim.x;
-    int value = 0;
 
-    for (int i = 0; i < kernelDim; ++i)
-    {
-        for (int j = 0; j < kernelDim; ++j) {
-            value += kernel[j * kernelDim + i] * source[from2Dto1D(x + (i - kernelDim / 2), y + (j - kernelDim / 2))];
+
+/* MACRO UTILITY */
+#define from2Dto1D(_cols, _i, _j) (((_cols) * _i) + (_j))
+#define bound(_var, _lower, _upper) _var = (_var < _lower) ? _lower : (_var > _upper) ? _upper : _var
+
+
+/* CUDA PROCEDURE */
+__global__ void applyFilterCuda(uchar4* dst, const uchar4* src, const size_t rows, const size_t cols) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    const int j = blockIdx.y * blockDim.y + threadIdx.y;
+    const int dstPixel = from2Dto1D( cols, i, j );
+    float dstValue[3] = {0, 0, 0};
+
+
+    if ((i < rows) && (j < cols)) {
+        for (int ki = 0; ki < kernelDim; ++ki) {
+            for (int kj = 0; kj < kernelDim; ++kj) {
+
+                const float kernelValue = kernel[from2Dto1D(kernelDim, ki, kj)];
+                const int srcI = i + (ki - kernelDim / 2);
+                const int srcJ = j + (kj - kernelDim / 2);
+                const int srcPixel = from2Dto1D(cols, srcI, srcJ);
+
+                if (srcI < 0 || srcI > rows || srcJ  < 0 || srcJ > cols) continue;
+
+                dstValue[0] += kernelValue * src[srcPixel].x;
+                dstValue[1] += kernelValue * src[srcPixel].y;
+                dstValue[2] += kernelValue * src[srcPixel].z;
+            }
         }
-    }
 
-    value = value / (divisor);
-    if (value < 255) {
-        if (value < 0) {
-            target[idx] = 0;
-        }
-        else {
-            target[idx] = value;
-        }
+        dstValue[0] /= kernelDivisor;
+        dstValue[1] /= kernelDivisor;
+        dstValue[2] /= kernelDivisor;
+
+        bound(dstValue[0], 0, 255);
+        bound(dstValue[1], 0, 255); 
+        bound(dstValue[2], 0, 255);
+
+        dst[dstPixel].x = static_cast<uchar>( dstValue[0] );
+        dst[dstPixel].y = static_cast<uchar>( dstValue[1] );
+        dst[dstPixel].z = static_cast<uchar>( dstValue[2] );
     }
-    else {
-        target[idx] = 255;
-    }
-    
 }
 
+/* CONVERSION 8UC4 PROCEDURE */
+void convert_8UC4(cv::Mat& image) {
 
+    if (image.channels() == 3) cvtColor(image, image, cv::COLOR_BGR2BGRA);
+    else if (image.channels() == 1) cvtColor(image, image, cv::COLOR_GRAY2BGRA);
+
+    if (image.depth() != CV_8U) image.convertTo(image, CV_8U);
+
+    if (image.channels() != 4 || image.depth() != CV_8U) {
+        printf("\n\nERROR: Could not convert the image to 8UC4 !\n\n");
+        exit(-1);
+    }
+}
+
+/* INTERFACE FILTER PROCEDURE */
+void applyFilter(std::string const& input, std::string const& output) {
+    cv::Mat srcImg = cv::imread(input, cv::IMREAD_UNCHANGED);
+    convert_8UC4(srcImg);
+    cv::Mat dstImg(srcImg.size(), srcImg.type());
+
+    const size_t rows = srcImg.rows;
+    const size_t cols = srcImg.cols;
+    const size_t bytes = sizeof(uchar4) * rows * cols;
+
+    const dim3 blockSize(BLOCK_SIZE, BLOCK_SIZE);
+    const dim3 gridSize((rows + blockSize.x - 1) / blockSize.x, (cols + blockSize.y - 1) / blockSize.y);
+
+
+    uchar4* srcCuda, * dstCuda;
+
+
+    cudaMalloc((void**)&srcCuda, bytes);
+    cudaMalloc((void**)&dstCuda, bytes);
+
+    cudaMemcpy(srcCuda, srcImg.ptr<uchar>(0), bytes, cudaMemcpyHostToDevice);
+    cudaMemset(dstCuda, 255, bytes);
+
+
+    /*float elapsed = 0;
+    cudaEvent_t start, stop;
+    (cudaEventCreate(&start));
+    (cudaEventCreate(&stop));
+    (cudaEventRecord(start, 0));*/
+
+    applyFilterCuda << <gridSize, blockSize >> > (dstCuda, srcCuda, rows, cols);
+
+    /*(cudaEventRecord(stop, 0));
+    (cudaEventSynchronize(stop));
+    (cudaEventElapsedTime(&elapsed, start, stop));
+    (cudaEventDestroy(start));
+    (cudaEventDestroy(stop));
+    printf("The elapsed time in gpu was %.2f ms\n", elapsed);*/
+
+
+    cudaMemcpy(dstImg.ptr<uchar>(0), dstCuda, bytes, cudaMemcpyDeviceToHost);
+
+    cudaFree(srcCuda);
+    cudaFree(dstCuda);
+
+
+    cv::imwrite(output, dstImg);
+}
+
+/* MAIN EXAMPLE (COULD PASS FILE PATHS BY COMMAND LINE ARGUMENTS) */
 int main() {
-
-    std::string folder = "C:/Users/luis/Desktop/source/";
-
-    cv::Mat img = cv::imread(folder + "input.tif");
-
-
-
-    cv::Mat filterImgMat(img);
-    unsigned char* sourceR;
-    unsigned char* sourceG;
-    unsigned char* sourceB;
-    unsigned char* targetR;
-    unsigned char* targetG;
-    unsigned char* targetB;
-    int* kernel;
-    
-    const int height = img.size().height;
-    const int width = img.size().width;
-    dim3 grid(width, height);
-
-
-    /*int kernelH[] = { 1, 4, 6, 4, 1,
-                     4, 16, 24, 16, 4,
-                     2, 24, 36, 24, 2,
-                     4, 16, 24, 16, 4,
-                     1, 4, 6, 4, 1};*/
-
-    /*int kernelH[] = { 1, 4, 6, 4, 1,
-                    4, 16, 24, 16, 4,
-                    2, 24, -476, 24, 2,
-                    4, 16, 24, 16, 4,
-                    1, 4, 6, 4, 1};*/
-
-    int kernelH[] = {
-        0, 0, 1, 2, 1, 0, 0,
-        0, 3, 13, 22, 13, 3, 0,
-        1, 13, 59, 97, 59, 13, 1,
-        2, 22, 97, 159, 97, 22, 2,
-        1, 13, 59, 97, 59, 13, 1,
-        0, 3, 13, 22, 13, 3, 0,
-        0, 0, 1, 2, 1, 0, 0,
-    };
-
-
-    
-
-   /* int kernelH[] = { -1, 0, 1,
-                      -1, 0, 1,
-                      -1, 0, 1 };*/
-    int divisor = 1003;
-
-
-    int kernelDim = sqrt(sizeof(kernelH)/sizeof(int));
-
-    cudaMalloc((void**)&kernel, kernelDim * kernelDim * sizeof(int));
-
-
-    cudaMalloc((void**)&sourceR, width * height * sizeof(char));
-    cudaMalloc((void**)&sourceG, width * height * sizeof(char));
-    cudaMalloc((void**)&sourceB, width * height * sizeof(char));
-    cudaMalloc((void**)&targetR, width * height * sizeof(char));
-    cudaMalloc((void**)&targetG, width * height * sizeof(char));
-    cudaMalloc((void**)&targetB, width * height * sizeof(char));
-
-
-
-    uchar* imgMatrixR = new uchar[width * height];
-    uchar* imgMatrixG = new uchar[width * height];
-    uchar* imgMatrixB = new uchar[width * height];
-
-    for (int col = 0; col < height; ++col) {
-        for (int row = 0; row < width; ++row) {
-            auto v = img.at<cv::Vec3b>(col, row);
-            imgMatrixR[width * col + row] = v[0];
-            imgMatrixG[width * col + row] = v[1];
-            imgMatrixB[width * col + row] = v[2];
-        }
-    }
-
-    cudaMemcpy(kernel, kernelH, kernelDim * kernelDim * sizeof(int), cudaMemcpyHostToDevice);
-    cudaMemcpy(sourceR, imgMatrixR, width * height * sizeof(char), cudaMemcpyHostToDevice);
-    cudaMemcpy(sourceG, imgMatrixG, width * height * sizeof(char), cudaMemcpyHostToDevice);
-    cudaMemcpy(sourceB, imgMatrixB, width * height * sizeof(char), cudaMemcpyHostToDevice);
-    
- 
-
-    betterCombKernel << < grid, 1 >> > (sourceR, targetR, kernel, kernelDim, divisor);
-    betterCombKernel << < grid, 1 >> > (sourceG, targetG, kernel, kernelDim, divisor);
-    betterCombKernel << < grid, 1 >> > (sourceB, targetB, kernel, kernelDim, divisor);
-
-
-    cudaMemcpy(imgMatrixR, targetR, width * height * sizeof(char), cudaMemcpyDeviceToHost);
-    cudaMemcpy(imgMatrixG, targetG, width * height * sizeof(char), cudaMemcpyDeviceToHost);
-    cudaMemcpy(imgMatrixB, targetB, width * height * sizeof(char), cudaMemcpyDeviceToHost);
-
-    for (int col = kernelDim/2; col < height; ++col) {
-        for (int row = kernelDim/2; row < width; ++row) {
-            cv::Vec3b v = filterImgMat.at<cv::Vec3b>(col, row);
-            v[0] = imgMatrixR[width * col + row];
-            v[1] = imgMatrixG[width * col + row];
-            v[2] = imgMatrixB[width * col + row];
-            filterImgMat.at<cv::Vec3b>(col, row) = v;
-        }
-    }
-
-    cv::imwrite(folder + "output5.jpg", filterImgMat);
-    
-    cudaFree(sourceR);
-    cudaFree(sourceG);
-    cudaFree(sourceB);
-    cudaFree(targetR);
-    cudaFree(targetG);
-    cudaFree(targetB);
-    cudaFree(kernel);
-    delete [] imgMatrixR;
-    delete [] imgMatrixG;
-    delete [] imgMatrixB;
-
+    const std::string folder = "C:/Users/INTEL/Downloads/";
+    applyFilter(folder + "input.jpg", folder + "output.jpg");
+    return 0;
 }
